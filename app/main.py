@@ -3,6 +3,8 @@
 接口概览（前缀 /api/v1）：
   POST   /sessions                      创建上传会话（可选 Idempotency-Key 幂等创建）
   GET    /sessions/{id}                 查询状态与缺失区间
+  GET    /sessions/{id}/progress        进度快照：同一只读读事务返回已收区间与事件游标
+  GET    /sessions/{id}/events          按游标分页拉取游标之后的分片接收事件（断线重连增量同步）
   PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验；可选 X-Chunk-Claim 认领令牌）
   PUT    /sessions/{id}/chunks/repair   已收分片原位修复（区间必须与某已登记分片完全一致；可选 X-Chunk-SHA256）
   POST   /sessions/{id}/chunks/audit    上传中会话的分片完整性诊断（按清单逐条核对磁盘分片，只读）
@@ -115,6 +117,34 @@ def _existing_intervals(tx: sqlite3.Connection, session_id: str) -> list[tuple[i
             (session_id,),
         ).fetchall()
     ]
+
+
+def _record_chunk_event(
+    tx: sqlite3.Connection,
+    session_id: str,
+    start: int,
+    end: int,
+    source: str,
+    created_at_iso: str,
+) -> None:
+    """在分片登记事务内写入一条分片接收事件（同会话序号严格连续、单调递增）。
+
+    调用方必须处于已开启的 IMMEDIATE 事务中，且本事务刚刚完成该分片的
+    chunks 行登记：事件与登记同生共死，事务回滚则事件也不存在。
+    ``COALESCE(MAX(seq), 0) + 1`` 配合 (session_id, seq) 唯一约束与
+    IMMEDIATE 的写串行化，保证序号无洞、不重复。只允许两类成功登记调用：
+    普通 PUT 分片（source='upload'）与服务端 copy-chunk（source='copy'）；
+    失败请求、重叠冲突与 chunks/repair 原位修复一律不调用本函数。
+    旧会话（v5 之前）事件表为空，首个新分片自然取得 seq=1，已有 chunks
+    即为游标 0 的快照基线。
+    """
+    tx.execute(
+        "INSERT INTO chunk_events "
+        "(session_id, seq, start_offset, end_offset, source, created_at) "
+        "SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ? "
+        "FROM chunk_events WHERE session_id = ?",
+        (session_id, start, end, source, created_at_iso, session_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +278,134 @@ def get_session(session_id: str) -> dict:
     with session_locks.get(session_id):
         row = _load_session(session_id)
         return _session_payload(row)
+
+
+# ---------------------------------------------------------------------------
+# 分片进度增量同步（断线重连 / 多端协作）
+#
+# 多端在断线重连后需要知道“别的客户端在我离线期间成功提交了哪些区间”。
+# 同步模型为“快照 + 游标续读”：
+#   1. GET /sessions/{id}/progress 在同一个只读事务（同一一致性快照）中
+#      返回当前已收区间（基线）与该会话的事件游标；
+#   2. 之后 GET /sessions/{id}/events?cursor=N 按序返回游标之后成功接收
+#      的区间（普通上传与服务端复制分片在登记事务内各写一条同会话单调
+#      递增的事件；失败、重试冲突与原位修复不产生事件）。
+# 不漏提交的依据（SQLite WAL + IMMEDIATE 写串行化）：快照与事件页都在
+# 只读事务中读取已提交数据。若事件 E 在快照读之后提交，则其 seq 必然
+# 大于快照游标，会出现在游标续读中；若 E 在快照读之前提交，则其区间
+# 已包含在快照基线里。不存在“基线没有、事件也读不到”的提交。
+# 旧会话不回填事件：迁移前已有的 chunks 即为游标 0 的基线，首个新分片
+# 取得 seq=1 后续号。
+# ---------------------------------------------------------------------------
+
+
+def _progress_snapshot(session_id: str) -> dict:
+    """在同一个只读事务内读取会话状态、已收区间（合并）与事件游标。"""
+    with db.snapshot_read() as conn:
+        row = conn.execute(
+            "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise _http(404, "session not found")
+        if row["status"] in ("aborted", "expired"):
+            raise _http(410, f"session {row['status']}")
+
+        # 区间与游标必须取自同一读事务：二者在同一条时间线上，
+        # 快照之后提交的分片其事件 seq 一定大于这里读到的游标。
+        chunk_rows = conn.execute(
+            "SELECT start_offset, end_offset FROM chunks WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        received = [(r["start_offset"], r["end_offset"]) for r in chunk_rows]
+        cursor_row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS cursor FROM chunk_events "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+
+    merged = storage.merge_intervals(received)
+    missing = storage.missing_intervals(received, row["total_size"])
+    return {
+        "session_id": session_id,
+        "status": row["status"],
+        "total_size": row["total_size"],
+        "bytes_received": row["bytes_received"],
+        "received_ranges": [{"start": s, "end": e} for s, e in merged],
+        "missing_ranges": [{"start": s, "end": e} for s, e in missing],
+        "event_cursor": cursor_row["cursor"],
+        # 完成后的会话不再过期；uploading 会话把过期时间回给客户端判断新鲜度。
+        "expires_at": row["expires_at"] if row["status"] == "uploading" else None,
+    }
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}/progress",
+    response_model=schemas.ProgressSnapshotResponse,
+    tags=["progress"],
+)
+def get_progress_snapshot(session_id: str) -> dict:
+    """进度快照：同一只读读事务内返回当前已收区间与事件游标（不滑动 TTL）。"""
+    return _progress_snapshot(session_id)
+
+
+def _list_chunk_events(session_id: str, cursor: int, limit: int) -> dict:
+    """按游标分页读取事件：按序返回 cursor 之后成功接收的区间。"""
+    with db.snapshot_read() as conn:
+        row = conn.execute(
+            "SELECT status FROM upload_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise _http(404, "session not found")
+        if row["status"] in ("aborted", "expired"):
+            raise _http(410, f"session {row['status']}")
+
+        # 多取 1 条判断是否还有下一页，避免额外 COUNT。
+        rows = conn.execute(
+            "SELECT seq, start_offset, end_offset, source, created_at "
+            "FROM chunk_events WHERE session_id = ? AND seq > ? "
+            "ORDER BY seq ASC LIMIT ?",
+            (session_id, cursor, limit + 1),
+        ).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    events = [
+        {
+            "seq": r["seq"],
+            "start": r["start_offset"],
+            "end": r["end_offset"],
+            "source": r["source"],
+            "created_at": r["created_at"],
+        }
+        for r in page
+    ]
+    return {
+        "session_id": session_id,
+        "cursor": cursor,
+        "events": events,
+        # 游标即“本会话已读位置”：只要本页非空就返回末条事件 seq，
+        # 客户端总能前移游标；是否立即翻页由 has_more 决定。
+        "next_cursor": page[-1]["seq"] if page else None,
+        "has_more": has_more,
+    }
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}/events",
+    response_model=schemas.ChunkEventListResponse,
+    tags=["progress"],
+)
+def list_chunk_events(
+    session_id: str,
+    cursor: int = Query(
+        0, ge=0, description="事件游标：只返回序号严格大于该游标的事件"
+    ),
+    limit: int = Query(
+        100, ge=1, le=100, description="每页事件条数，范围 1～100（默认 100）"
+    ),
+) -> dict:
+    """按游标分页返回成功接收区间事件（只读、按 seq 升序，页大小 1～100）。"""
+    return _list_chunk_events(session_id, cursor, limit)
 
 
 @app.delete("/api/v1/sessions/{session_id}", status_code=204, tags=["sessions"])
@@ -564,6 +722,8 @@ def _commit_chunk(
                     "VALUES (?, ?, ?, ?, ?)",
                     (session_id, start, end, end - start, now_iso),
                 )
+                # 成功登记才写事件：与 chunks 行同一事务，同会话序号连续递增。
+                _record_chunk_event(tx, session_id, start, end, "upload", now_iso)
                 tx.execute(
                     "UPDATE upload_sessions "
                     "SET bytes_received = bytes_received + ?, "
@@ -1259,6 +1419,11 @@ def _copy_chunk(
                     "(session_id, start_offset, end_offset, size, received_at) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (target_session_id, target_start, target_end, length, now_iso),
+                )
+                # 服务端复制分片成功登记同样产生事件（source='copy'）；
+                # 与登记同一事务，失败回滚则不产生事件。
+                _record_chunk_event(
+                    tx, target_session_id, target_start, target_end, "copy", now_iso
                 )
                 tx.execute(
                     "UPDATE upload_sessions "

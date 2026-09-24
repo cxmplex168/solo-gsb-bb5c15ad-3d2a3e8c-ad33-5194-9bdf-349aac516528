@@ -87,6 +87,27 @@ def read_only() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextmanager
+def snapshot_read() -> Iterator[sqlite3.Connection]:
+    """在只读连接上开启一个延迟读事务，事务内全部 SELECT 看到同一数据库快照。
+
+    与 :func:`read_only` 的区别：后者每条语句都是独立的隐式读事务，
+    两条语句之间可能有别的写事务提交；这里显式 ``BEGIN ... COMMIT`` 包住
+    多条 SELECT，保证“已收区间 + 事件游标”这类需要跨表同时读取的结果
+    取自同一个一致性快照。连接本身仍是 ``mode=ro`` + ``query_only``：
+    绝不写库（不滑动 TTL、不触发懒过期）。
+    """
+    with read_only() as conn:
+        conn.execute("BEGIN")  # 延迟事务：首条 SELECT 时才获取一致性读快照
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # 结构与迁移
 #
@@ -95,6 +116,7 @@ def read_only() -> Iterator[sqlite3.Connection]:
 #   v2：download_tickets（受控下载票据）
 #   v3：idempotency_keys（创建会话幂等键）
 #   v4：chunk_claims（分片认领令牌，仅存令牌 SHA-256）
+#   v5：chunk_events（分片接收事件流，同会话序号单调递增，用于断线重连增量同步）
 # 全部 DDL 均为 IF NOT EXISTS，重复执行安全；老库数据在迁移中保留。
 # ---------------------------------------------------------------------------
 
@@ -191,12 +213,44 @@ CREATE INDEX IF NOT EXISTS idx_chunk_claims_expires
     ON chunk_claims(expires_at);
 """
 
+MIGRATION_5 = """
+-- 分片接收事件流：每个会话独立维护从 1 开始、严格连续（无洞）单调递增的
+-- 序号 seq，供多端断线重连后按游标增量追踪其他客户端新提交的区间。
+--
+-- 只记录“分片成功登记”这一事实：普通 PUT 分片记 source='upload'，
+-- 服务端 copy-chunk 记 source='copy'，与 chunks 行在同一个 IMMEDIATE
+-- 事务内写入（要么都可见，要么都回滚）。失败请求、重叠冲突（409）与
+-- chunks/repair 原位修复不产生事件——修复只改内容，区间集合不变。
+--
+-- 旧会话（从 v4 及更早升级）不回填事件：迁移时其已有 chunks 即“快照
+-- 基线”，游标基线为 0；首个成功登记的新分片取得 seq=1，从此在基线之后
+-- 续号。游标 0 之后的事件区间必然不与基线 chunks 重叠（登记重叠会被
+-- 拒绝），客户端“先快照拿基线与游标、再按游标追事件”不会漏掉两次请求
+-- 之间任何一次提交。
+CREATE TABLE IF NOT EXISTS chunk_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL
+                        REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL CHECK (seq >= 1),
+    start_offset  INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset    INTEGER NOT NULL CHECK (end_offset > start_offset),
+    source        TEXT NOT NULL CHECK (source IN ('upload', 'copy')),
+    created_at    TEXT NOT NULL,
+    UNIQUE (session_id, seq)
+);
+
+-- 按游标分页：WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?
+CREATE INDEX IF NOT EXISTS idx_chunk_events_session_seq
+    ON chunk_events(session_id, seq);
+"""
+
 # 版本号 -> 迁移脚本；版本号同时写入 PRAGMA user_version。
 _MIGRATIONS: dict[int, str] = {
     1: MIGRATION_1,
     2: MIGRATION_2,
     3: MIGRATION_3,
     4: MIGRATION_4,
+    5: MIGRATION_5,
 }
 LATEST_USER_VERSION = max(_MIGRATIONS)
 

@@ -89,6 +89,83 @@ class ChunkResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 分片进度增量同步（progress snapshot + chunk events）
+# ---------------------------------------------------------------------------
+
+
+class ProgressSnapshotResponse(BaseModel):
+    """进度快照：已收区间与事件游标取自同一个数据库读事务（同一一致性快照）。
+
+    多端重连时先取本快照，把 ``received_ranges`` 作为基线、``event_cursor``
+    作为游标，再轮询 GET .../events?cursor=... 追增量，不会漏掉两次请求之间
+    其他客户端成功提交的区间。
+    """
+
+    session_id: str
+    status: str = Field(
+        ..., description="会话当前状态（快照时点）：uploading / completed / expired"
+    )
+    total_size: int
+    bytes_received: int = Field(..., description="快照时点已登记字节数")
+    received_ranges: list[MissingRange] = Field(
+        ...,
+        description=(
+            "当前已收区间（合并相邻区间后按起点升序）；旧会话以此作为事件基线"
+        ),
+    )
+    missing_ranges: list[MissingRange] = Field(
+        ..., description="相对 total_size 仍缺失的区间"
+    )
+    event_cursor: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "本会话事件游标（=已生成的最大事件序号，无事件时为 0）；"
+            "之后以 ?cursor=<该值> 拉取游标之后的事件"
+        ),
+    )
+    expires_at: str | None = Field(
+        default=None, description="会话过期时间；非 uploading 状态可能为 null"
+    )
+
+
+class ChunkEvent(BaseModel):
+    """一条分片接收事件：序号在同一会话内从 1 开始严格连续、单调递增。"""
+
+    seq: int = Field(..., ge=1, description="会话内单调递增的事件序号（游标值）")
+    start: int = Field(..., description="成功登记区间的起始偏移（含）")
+    end: int = Field(..., description="成功登记区间的结束偏移（不含）")
+    source: str = Field(
+        ...,
+        description=(
+            "接收来源：upload=普通 PUT 分片；copy=服务端 copy-chunk。"
+            "失败、重叠冲突与原位修复不产生事件"
+        ),
+    )
+    created_at: str = Field(..., description="事件写入时间（UTC，ISO-8601 带 Z）")
+
+
+class ChunkEventListResponse(BaseModel):
+    """按游标分页的事件页：按序返回 cursor 之后成功接收的区间。"""
+
+    session_id: str
+    cursor: int = Field(..., ge=0, description="本次请求使用的游标（回显）")
+    events: list[ChunkEvent] = Field(
+        ..., description="游标之后的事件，按 seq 升序，最多 limit 条"
+    )
+    next_cursor: int | None = Field(
+        default=None,
+        description=(
+            "下一页游标（=本页最后一条事件的 seq）；本页为空时为 null。"
+            "无论 has_more 是否为 false，客户端都可用它继续轮询新提交"
+        ),
+    )
+    has_more: bool = Field(
+        ..., description="游标之后是否还有超过本页大小的事件未返回"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 分片认领（chunk-claims）
 # ---------------------------------------------------------------------------
 
