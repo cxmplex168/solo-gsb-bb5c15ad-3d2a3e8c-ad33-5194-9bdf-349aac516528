@@ -95,6 +95,7 @@ def read_only() -> Iterator[sqlite3.Connection]:
 #   v2：download_tickets（受控下载票据）
 #   v3：idempotency_keys（创建会话幂等键）
 #   v4：chunk_claims（分片认领令牌，仅存令牌 SHA-256）
+#   v5：chunk_events（分片进度事件流，同会话单调递增序号）
 # 全部 DDL 均为 IF NOT EXISTS，重复执行安全；老库数据在迁移中保留。
 # ---------------------------------------------------------------------------
 
@@ -191,12 +192,34 @@ CREATE INDEX IF NOT EXISTS idx_chunk_claims_expires
     ON chunk_claims(expires_at);
 """
 
+MIGRATION_5 = """
+-- 分片进度事件流：每次分片成功登记（普通 PUT 与 copy-chunk）在同一事务内
+-- 追加一条事件，seq 在同一会话内单调递增（登记事务内取 MAX(seq)+1，
+-- BEGIN IMMEDIATE 串行化保证不重复；事务回滚则事件一并消失）。
+-- 失败、重试冲突与分片修复（repair）不产生事件。
+-- 旧会话迁移后本表为空：其既有 chunks 区间即快照基线，后续事件从 seq=1 继续。
+-- 会话删除时经 ON DELETE CASCADE 一并删除。
+CREATE TABLE IF NOT EXISTS chunk_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL
+                        REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL CHECK (seq > 0),
+    start_offset  INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset    INTEGER NOT NULL CHECK (end_offset > start_offset),
+    received_at   TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_events_session_seq
+    ON chunk_events(session_id, seq);
+"""
+
 # 版本号 -> 迁移脚本；版本号同时写入 PRAGMA user_version。
 _MIGRATIONS: dict[int, str] = {
     1: MIGRATION_1,
     2: MIGRATION_2,
     3: MIGRATION_3,
     4: MIGRATION_4,
+    5: MIGRATION_5,
 }
 LATEST_USER_VERSION = max(_MIGRATIONS)
 

@@ -8,6 +8,8 @@
   POST   /sessions/{id}/chunks/audit    上传中会话的分片完整性诊断（按清单逐条核对磁盘分片，只读）
   POST   /sessions/{id}/chunk-claims    认领尚未接收的半开区间，返回一次性随机令牌（5 分钟有效）
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
+  GET    /sessions/{id}/progress        进度快照：同事务返回已收区间与事件游标（多端增量同步基线）
+  GET    /sessions/{id}/progress/events 按游标分页返回其后成功接收的区间事件（页大小 1～100）
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
   GET    /sessions/{id}/download        会话下载（原有接口，不计数）
@@ -31,7 +33,7 @@ from anyio.to_thread import run_sync
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import claims, db, idempotency, schemas, settings, storage
+from . import claims, db, idempotency, progress, schemas, settings, storage
 from .cleanup import start_janitor
 from .locks import session_locks
 
@@ -564,6 +566,8 @@ def _commit_chunk(
                     "VALUES (?, ?, ?, ?, ?)",
                     (session_id, start, end, end - start, now_iso),
                 )
+                # 成功登记才追加进度事件：与 chunks 插入同事务，回滚即无事件。
+                progress.record_chunk_event(tx, session_id, start, end, now_iso)
                 tx.execute(
                     "UPDATE upload_sessions "
                     "SET bytes_received = bytes_received + ?, "
@@ -1260,6 +1264,10 @@ def _copy_chunk(
                     "VALUES (?, ?, ?, ?, ?)",
                     (target_session_id, target_start, target_end, length, now_iso),
                 )
+                # 服务端复制成功登记同样追加进度事件（与普通 PUT 同一事件流）。
+                progress.record_chunk_event(
+                    tx, target_session_id, target_start, target_end, now_iso
+                )
                 tx.execute(
                     "UPDATE upload_sessions "
                     "SET bytes_received = bytes_received + ?, "
@@ -1296,6 +1304,86 @@ def copy_chunk(session_id: str, body: schemas.CopyChunkRequest) -> dict:
         source_end=body.source_end,
         target_start=body.target_start,
     )
+
+
+# ---------------------------------------------------------------------------
+# 分片进度增量同步（progress）
+#
+# 多端协作上传时，客户端断线重连后需要知道其他客户端在此期间提交了哪些
+# 区间。仅查一次状态接口无法表达“两次请求之间发生了什么”，因此额外提供：
+#   GET  /progress        进度快照：同一次读事务返回当前已收区间与事件游标
+#   GET  /progress/events 按游标分页返回其后“成功接收”的区间事件
+# 正确用法：先取快照（已收区间 + 游标）建立本地视图，再用游标反复翻页
+# 追赶增量。快照的游标与已收区间来自同一数据库快照，两次请求之间提交的
+# 区间序号必然大于快照游标，因此不会漏掉：区间要么在快照基线中，要么在
+# 事件流中。事件只在普通 PUT 与 copy-chunk 的登记事务内追加，失败、
+# 重试冲突与分片修复（repair）不产生事件。
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}/progress",
+    response_model=schemas.ProgressSnapshotResponse,
+    tags=["progress"],
+)
+def get_progress_snapshot(session_id: str) -> dict:
+    """进度快照：同一读事务中返回当前已收区间（合并）与事件游标。"""
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        # 已收区间与游标必须取自同一次读事务（见 progress.snapshot）。
+        received, cursor = progress.snapshot(session_id)
+    merged = storage.merge_intervals(received)
+    return {
+        "session_id": session_id,
+        "status": row["status"],
+        "total_size": row["total_size"],
+        "bytes_received": row["bytes_received"],
+        "received_ranges": [{"start": s, "end": e} for s, e in merged],
+        "cursor": cursor,
+    }
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}/progress/events",
+    response_model=schemas.ChunkEventsResponse,
+    tags=["progress"],
+)
+def get_progress_events(
+    session_id: str,
+    after: int = Query(
+        default=0,
+        ge=0,
+        description="事件游标：仅返回序号严格大于该值的事件（首次取 0 或快照返回的 cursor）",
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=100,
+        description="页大小，1～100；has_more=true 时以 next_cursor 继续翻页",
+    ),
+) -> dict:
+    """按游标分页返回其后成功接收的区间事件，按 seq 升序。"""
+    with session_locks.get(session_id):
+        _load_session(session_id)
+        rows, has_more = progress.events_after(session_id, after, limit)
+
+    events = [
+        {
+            "seq": r["seq"],
+            "start": r["start_offset"],
+            "end": r["end_offset"],
+            "received_at": r["received_at"],
+        }
+        for r in rows
+    ]
+    # 空页游标保持不变：客户端反复轮询时不会丢失“最后已知位置”。
+    next_cursor = events[-1]["seq"] if events else after
+    return {
+        "session_id": session_id,
+        "events": events,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
 
 
 # ---------------------------------------------------------------------------

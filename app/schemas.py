@@ -214,6 +214,53 @@ class ChunkAuditResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 分片进度增量同步（progress）
+# ---------------------------------------------------------------------------
+
+
+class ProgressSnapshotResponse(BaseModel):
+    """进度快照：已收区间与事件游标取自同一次数据库读事务。"""
+
+    session_id: str
+    status: str = Field(..., description="会话状态：uploading / completed")
+    total_size: int
+    bytes_received: int
+    received_ranges: list[MissingRange] = Field(
+        ..., description="当前已收区间（合并后的半开区间，按起点升序）"
+    )
+    cursor: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "事件游标：当前最大事件序号（无事件时为 0）。"
+            "用它调用事件接口即可追赶快照之后的全部增量"
+        ),
+    )
+
+
+class ChunkEvent(BaseModel):
+    """一条进度事件：某区间成功接收（普通 PUT 或 copy-chunk 登记）。"""
+
+    seq: int = Field(..., ge=1, description="同会话单调递增的事件序号")
+    start: int = Field(..., ge=0, description="起始偏移（含）")
+    end: int = Field(..., ge=0, description="结束偏移（不含），半开区间")
+    received_at: str = Field(..., description="登记时间（UTC ISO-8601）")
+
+
+class ChunkEventsResponse(BaseModel):
+    session_id: str
+    events: list[ChunkEvent] = Field(
+        ..., description="游标之后的事件，按 seq 升序，最多 limit 条"
+    )
+    next_cursor: int = Field(
+        ...,
+        ge=0,
+        description="下次请求的游标：本页最后一条事件的 seq（空页时等于入参 after）",
+    )
+    has_more: bool = Field(..., description="为 true 时以 next_cursor 继续翻页")
+
+
+# ---------------------------------------------------------------------------
 # 受控下载票据
 # ---------------------------------------------------------------------------
 
